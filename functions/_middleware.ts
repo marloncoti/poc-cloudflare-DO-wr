@@ -1,15 +1,17 @@
 /**
- * Waiting Room Middleware for Cloudflare Pages (KV-based)
+ * Waiting Room Middleware for Cloudflare Pages (Durable Objects)
  *
  * Controla el acceso a la aplicación limitando usuarios concurrentes.
  * Los usuarios que exceden el límite ven una página de espera.
  *
- * MEJORA: El contador se recalcula basándose en sesiones reales,
- * evitando desincronización cuando las sesiones expiran por TTL.
+ * El conteo y gestión de sesiones se delega al WaitingRoomDO,
+ * que garantiza atomicidad y elimina el race condition del enfoque KV.
  */
+import type { TryEnterResponse, RefreshResponse } from './waiting-room-do';
 
 interface Env {
   WAITING_ROOM: KVNamespace;
+  WAITING_ROOM_DO: DurableObjectNamespace;
 }
 
 interface WaitingRoomConfig {
@@ -93,46 +95,55 @@ function createSessionCookie(sessionId: string, config: WaitingRoomConfig): stri
 }
 
 /**
- * Cuenta sesiones activas reales usando KV list.
- * Esto evita desincronización del contador.
+ * Obtiene el stub de la instancia global única del WaitingRoomDO.
+ * Usar siempre idFromName('global') garantiza que todos los requests
+ * lleguen a la misma instancia, manteniendo el estado centralizado.
  */
-async function getRealActiveCount(kv: KVNamespace): Promise<number> {
-  const sessions = await kv.list({ prefix: 'session:' });
-  return sessions.keys.length;
+function getWaitingRoomStub(env: Env): DurableObjectStub {
+  const id = env.WAITING_ROOM_DO.idFromName('global');
+  return env.WAITING_ROOM_DO.get(id);
 }
 
-async function isSessionActive(kv: KVNamespace, sessionId: string): Promise<boolean> {
-  const session = await kv.get(`session:${sessionId}`);
-  return session !== null;
-}
-
-
-async function refreshSession(
-  kv: KVNamespace,
+/**
+ * Intenta admitir un usuario nuevo en el DO de forma atómica.
+ * El DO procesa este request de forma serializada — no hay race condition.
+ */
+async function doTryEnter(
+  stub: DurableObjectStub,
   sessionId: string,
   config: WaitingRoomConfig
-): Promise<void> {
-  await kv.put(`session:${sessionId}`, Date.now().toString(), {
-    expirationTtl: config.sessionDurationSeconds,
+): Promise<TryEnterResponse> {
+  const res = await stub.fetch('http://do/try-enter', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      sessionId,
+      maxActiveUsers: config.maxActiveUsers,
+      sessionDurationSeconds: config.sessionDurationSeconds,
+    }),
   });
+  return res.json<TryEnterResponse>();
 }
 
-async function createNewSession(
-  kv: KVNamespace,
+/**
+ * Renueva el TTL de una sesión existente en el DO.
+ * Retorna ok=false si la sesión ya no existe (expiró entre requests).
+ * En ese caso el middleware debe tratar al usuario como nuevo.
+ */
+async function doRefresh(
+  stub: DurableObjectStub,
   sessionId: string,
   config: WaitingRoomConfig
-): Promise<boolean> {
-  const currentCount = await getRealActiveCount(kv);
-
-  if (currentCount >= config.maxActiveUsers) {
-    return false;
-  }
-
-  await kv.put(`session:${sessionId}`, Date.now().toString(), {
-    expirationTtl: config.sessionDurationSeconds,
+): Promise<RefreshResponse> {
+  const res = await stub.fetch('http://do/refresh', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      sessionId,
+      sessionDurationSeconds: config.sessionDurationSeconds,
+    }),
   });
-
-  return true;
+  return res.json<RefreshResponse>();
 }
 
 function getWaitingRoomHTML(
@@ -345,20 +356,17 @@ export const onRequest: PagesFunction<Env> = async (context) => {
     return next();
   }
 
-  // DEBUG: Verificar que la function se ejecuta
   const addDebugHeader = (response: Response, status: string) => {
     const newResponse = new Response(response.body, response);
     newResponse.headers.set('X-Waiting-Room', status);
     return newResponse;
   };
 
-  // Si KV no está configurado, dejar pasar con header de debug
   if (!env.WAITING_ROOM) {
     const response = await next();
     return addDebugHeader(response, 'no-kv-binding');
   }
 
-  // validar si es sold oout
   const isSoldOut = await env.WAITING_ROOM.get('soldOut');
   if (isSoldOut === 'true') {
     return new Response(getSoldOutHTML(), {
@@ -372,53 +380,57 @@ export const onRequest: PagesFunction<Env> = async (context) => {
   }
 
   try {
-    // Verificar si el waiting room está habilitado
     const isEnabled = await env.WAITING_ROOM.get('enabled');
     if (isEnabled !== 'true') {
       const response = await next();
       return addDebugHeader(response, 'disabled');
     }
-  } catch (error) {
-    // Si hay error leyendo KV, dejar pasar
+  } catch {
     const response = await next();
     return addDebugHeader(response, 'kv-error');
   }
 
-  // Cargar configuración dinámica desde KV
+  // KV: solo configuración y flags (sin estado de sesiones)
   const config = await getConfig(env.WAITING_ROOM);
+
+  // DO: instancia global única — todos los requests pasan por aquí
+  const stub = getWaitingRoomStub(env);
 
   const existingSession = getSessionFromCookie(request, config);
 
-  // Si ya tiene sesión activa, renovar y dejar pasar
+  // Usuario con cookie: intentar renovar sesión en el DO
   if (existingSession) {
-    const isActive = await isSessionActive(env.WAITING_ROOM, existingSession);
-    if (isActive) {
-      await refreshSession(env.WAITING_ROOM, existingSession, config);
+    const refreshResult = await doRefresh(stub, existingSession, config);
+    if (refreshResult.ok) {
+      // Sesión vigente y renovada — dejar pasar sin tocar la cookie
       return next();
     }
+    // ok=false: la sesión expiró en el DO durante la inactividad del usuario
+    // Tratarlo como usuario nuevo y caer al try-enter
   }
 
-  // Intentar crear nueva sesión
-  const newSessionId = generateSessionId();
-  const sessionCreated = await createNewSession(env.WAITING_ROOM, newSessionId, config);
+  // Usuario nuevo (o con sesión expirada): solicitar admisión al DO
+  // Esta operación es atómica — el DO serializa el acceso al contador
+  const sessionId = generateSessionId();
+  const enterResult = await doTryEnter(stub, sessionId, config);
 
-  if (sessionCreated) {
+  if (enterResult.allowed) {
     const response = await next();
     const newResponse = new Response(response.body, response);
-    newResponse.headers.append('Set-Cookie', createSessionCookie(newSessionId, config));
+    newResponse.headers.append('Set-Cookie', createSessionCookie(sessionId, config));
     return newResponse;
   }
 
-  // No hay cupo, mostrar waiting room
-  const activeCount = await getRealActiveCount(env.WAITING_ROOM);
-  const queuePosition = Math.max(1, activeCount - config.maxActiveUsers + 1);
-
-  return new Response(getWaitingRoomHTML(queuePosition, activeCount, config), {
-    status: 503,
-    headers: {
-      'Content-Type': 'text/html;charset=UTF-8',
-      'Retry-After': '5',
-      'Cache-Control': 'no-store',
-    },
-  });
+  // Sin cupo: mostrar waiting room con posición real reportada por el DO
+  return new Response(
+    getWaitingRoomHTML(enterResult.position, enterResult.activeCount, config),
+    {
+      status: 503,
+      headers: {
+        'Content-Type': 'text/html;charset=UTF-8',
+        'Retry-After': '5',
+        'Cache-Control': 'no-store',
+      },
+    }
+  );
 };

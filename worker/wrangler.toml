@@ -1,0 +1,23 @@
+# =============================================================================
+# wrangler.toml — Worker standalone para WaitingRoomDO
+#
+# Este Worker existe exclusivamente para alojar la clase Durable Object.
+# El Pages project (wrangler.toml raiz) lo referencia via script_name.
+#
+# Deploy: wrangler deploy --config worker/wrangler.toml
+# (debe desplegarse ANTES que el Pages project)
+# =============================================================================
+
+name = "poc-waiting-room-do"
+main = "index.ts"
+compatibility_date = "2025-01-01"
+
+# =============================================================================
+# Migrations — aqui viven, NO en el Pages wrangler.toml
+#
+# Regla: nunca modificar un tag ya desplegado en produccion.
+# Para renombrar o eliminar una clase: agregar nuevo tag incremental.
+# =============================================================================
+[[migrations]]
+tag = "v1"
+new_classes = ["WaitingRoomDO"]

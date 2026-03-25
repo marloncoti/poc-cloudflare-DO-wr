@@ -1,0 +1,44 @@
+# =============================================================================
+# wrangler.toml — Cloudflare Pages + Durable Objects
+# Proyecto: poc-wr
+# =============================================================================
+
+name = "poc-wr"
+
+# Directorio de salida del build de Angular
+pages_build_output_dir = "dist/poc-waiting-room/browser"
+
+# Fecha de compatibilidad con la API de Workers
+# Mantener actualizada pero no cambiar sin revisar breaking changes
+compatibility_date = "2025-01-01"
+
+# =============================================================================
+# KV Namespace — configuración y flags del waiting room
+#
+# Responsabilidades de KV (se mantiene igual que antes):
+#   - enabled                    → "true" | "false"
+#   - soldOut                    → "true" | "false"
+#   - config:maxActiveUsers      → número como string
+#   - config:sessionDurationSeconds → número como string
+#
+# IMPORTANTE: Reemplaza los IDs con los valores reales de tu dashboard.
+#   Dashboard → Workers & Pages → KV → <tu namespace> → detalles
+# =============================================================================
+[[kv_namespaces]]
+binding = "WAITING_ROOM"
+id = "177532b77f96447785f23be690d58813"
+preview_id = "177532b77f96447785f23be690d58813"  # puede ser el mismo ID para dev local
+
+# =============================================================================
+# Durable Objects — estado de sesiones en memoria (atómico)
+#
+# Pages NO soporta [[migrations]] ni clases DO locales.
+# La clase WaitingRoomDO debe vivir en un Worker separado ("poc-waiting-room-do")
+# y referenciarse aquí con script_name.
+#
+# El Worker separado (worker/wrangler.toml) es el que tiene las [[migrations]].
+# =============================================================================
+[[durable_objects.bindings]]
+name = "WAITING_ROOM_DO"
+class_name = "WaitingRoomDO"
+script_name = "poc-waiting-room-do"
